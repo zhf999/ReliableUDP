@@ -1,0 +1,10 @@
+{
+    "files.associations": {
+        "tcp.h": "c",
+        "kernel.h": "c",
+        "init.h": "c",
+        "rudp.h": "c",
+        "RUDP.C": "cpp"
+    },
+    "C_Cpp.errorSquiggles": "disabled"
+}
