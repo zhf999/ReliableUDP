@@ -1,1 +1,0 @@
-savedcmd_/home/hfzhou/RUDP_model/RUDP/RUDP.ko := ld -r -m elf_x86_64 -z noexecstack --build-id=sha1  -T scripts/module.lds -o /home/hfzhou/RUDP_model/RUDP/RUDP.ko /home/hfzhou/RUDP_model/RUDP/RUDP.o /home/hfzhou/RUDP_model/RUDP/RUDP.mod.o;  make -f ./arch/x86/Makefile.postlink /home/hfzhou/RUDP_model/RUDP/RUDP.ko
