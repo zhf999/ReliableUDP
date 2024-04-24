@@ -9,15 +9,16 @@ int rudp_init(struct sock *sk)
 	struct rudp_sock *rsock = rudp_sk(sk);
 	skb_queue_head_init(&sk->sk_write_queue);
 	skb_queue_head_init(&rsock->out_queue);
-	// sk->sk_send_head = (struct sk_buff*)&sk->sk_write_queue;
-	rsock->win_size = 5;
+
+	rsock->win_size = 1;
 	rsock->buf_size = 10;
 	rsock->in_flight = 0;
 	rsock->in_queue = 0;
 
 	timer_setup(&rsock->retransmit_timer,retransmit_handler,0);
-	rsock->retrans_timeout = 125;
-	rsock->ack_next = 0;
+	timer_setup(&rsock->delack_timer,delack_timer_handler,0);
+	rsock->retrans_timeout = HZ;
+	rsock->last_ack = 0;
 	rsock->max_retrans_time = 5;
 
 	get_random_bytes(&rsock->send_next_seq,sizeof(rsock->send_next_seq));
@@ -50,13 +51,19 @@ void retransmit_handler(struct timer_list *t)
 		tmp = skb_clone(pskb,GFP_ATOMIC);
 		ip_send_skb(sock_net(sk),tmp);
 	}
+	rsk->win_size -= 1;
 	bh_unlock_sock(sk);
-	try_flush_send_queue(sk);
+	// try_flush_send_queue(sk);
 
 	if(!skb_queue_empty(&rsk->out_queue))
 		reset_rudp_xmit_timer(sk,rsk->retrans_timeout);
 
 	sock_put(sk);
+}
+
+void retransmit_handler(struct timer_list *t)
+{
+	
 }
 
 void reset_rudp_xmit_timer(struct sock *sk,long delay)
@@ -75,29 +82,30 @@ void clear_rudp_xmit_timer(struct sock *sk)
 
 int rudp_connect(struct sock *sk,struct sockaddr *uaddr,int addr_len)
 {
-	return 0;
-	// long timeo = rudp_sk(sk)->retrans_timeout*10;
-	// struct sockaddr_in * sin = (struct sockaddr_in*)uaddr;
-	// if(sin->sin_addr.s_addr==INADDR_ANY)
-	// {
-	// 	printk(KERN_INFO "RUDP start listen!\n");
-	// 	lock_sock(sk);
-	// 	inet_wait_for_connect(sk,timeo,0);
-	// 	release_sock(sk);
-	// 	return 0;
-	// }	
-	// int res;
-	// printk(KERN_INFO "RUDP connection initiated....\n");
-	// rudp_sk(sk)->isClient = true;
-	// res = ip4_datagram_connect(sk, uaddr, addr_len);
-
-	// lock_sock(sk);
-	// rudp_sk(sk)->state = RUDP_STATE_SYN_SENT;
-	// rudp_send_syn(sk,uaddr);
-	// inet_wait_for_connect(sk,timeo,0);
-	// printk(KERN_INFO "timeo=%ld\n",timeo);
-	// release_sock(sk);
-	// return res;
+	long timeo = rudp_sk(sk)->retrans_timeout*10;
+	struct sockaddr_in * sin = (struct sockaddr_in*)uaddr;
+	if(sin->sin_addr.s_addr==INADDR_ANY)
+	{
+		printk(KERN_INFO "RUDP start listen!\n");
+		lock_sock(sk);
+		rudp_sk(sk)->state = RUDP_STATE_LISTEN;
+		rudp_sk(sk)->isClient = false;
+		inet_wait_for_connect(sk,timeo,0);
+		release_sock(sk);
+		return 0;
+	}	
+	int res;
+	printk(KERN_INFO "RUDP connection initiated....\n");
+	rudp_sk(sk)->isClient = true;
+	res = ip4_datagram_connect(sk, uaddr, addr_len);
+	lock_sock(sk);
+	rudp_sk(sk)->state = RUDP_STATE_SYN_SENT;
+	rudp_sk(sk)->isConnected = true;
+	rudp_send_syn(sk,uaddr);
+	inet_wait_for_connect(sk,timeo,0);
+	printk(KERN_INFO "timeo=%ld\n",timeo);
+	release_sock(sk);
+	return res;
 }
 
 int rudp_send_syn(struct sock *sk, struct sockaddr *uaddr)
@@ -119,7 +127,7 @@ int rudp_send_syn(struct sock *sk, struct sockaddr *uaddr)
 	uh->check = 0;
 
 	rudphdr->type = htons(RUDP_TYPE_SYN)>>8;
-	rudphdr->seq = rsk->send_next_seq++;
+	rudphdr->seq = htonl(rsk->send_next_seq++);
 	// printk(KERN_INFO "SYN seq=%u type=%x\n",rsk->send_next_seq-1,rudphdr->type);
 	rudphdr->len = 0;
 
@@ -135,11 +143,6 @@ long inet_wait_for_connect(struct sock *sk, long timeo, int writebias)
 	sk->sk_write_pending += writebias;
 	sk->sk_wait_pending++;
 
-	/* Basic assumption: if someone sets sk->sk_err, he _must_
-	 * change state of the socket from TCP_SYN_*.
-	 * Connect() does not allow to get error notifications
-	 * without closing the socket.
-	 */
 	while (rudp_sk(sk)->state!=RUDP_STATE_ESTABLISHED) {
 		// printk(KERN_INFO "sleep for a while\n");
 		release_sock(sk);
@@ -147,7 +150,7 @@ long inet_wait_for_connect(struct sock *sk, long timeo, int writebias)
 		lock_sock(sk);
 		if (signal_pending(current) || !timeo)
 		{
-			printk(KERN_INFO "a signal comes!\n");
+			printk(KERN_INFO "a signal comes!3\n");
 			break;
 		}
 			
@@ -498,7 +501,7 @@ int rudp_add_to_snd_queue(struct sk_buff *skb)
 	{
 		DEFINE_WAIT_FUNC(wait, woken_wake_function);
 		add_wait_queue(sk_sleep(sk), &wait);
-		long timeo = 5*HZ;
+		long timeo = 25*HZ;
 		lock_sock(sk);
 		while (rsock->in_queue>=rsock->buf_size) {
 			// printk(KERN_INFO "sleep for a while\n");
@@ -507,12 +510,13 @@ int rudp_add_to_snd_queue(struct sk_buff *skb)
 			lock_sock(sk);
 			if (signal_pending(current) || !timeo)
 			{
-				printk(KERN_INFO "a signal comes!\n");
+				printk(KERN_INFO "a signal comes!4\n");
 				break;
 			}
 		}
 		release_sock(sk);
 		remove_wait_queue(sk_sleep(sk), &wait);
+		printk(KERN_INFO "put %u into quque!\n",htonl(rudp_hdr(skb)->seq));
 	}
 
 	skb_queue_tail(&sk->sk_write_queue, skb);
@@ -612,7 +616,7 @@ void rudp_close(struct sock *sk,long timeout)
 	struct rudp_sock *rsock = rudp_sk(sk);
 	DEFINE_WAIT_FUNC(wait, woken_wake_function);
 	add_wait_queue(sk_sleep(sk), &wait);
-	long timeo = 5*HZ;
+	long timeo = 0;
 	lock_sock(sk);
 	while (rsock->in_flight!=0) {
 		// printk(KERN_INFO "sleep for a while\n");
@@ -621,7 +625,7 @@ void rudp_close(struct sock *sk,long timeout)
 		lock_sock(sk);
 		if (signal_pending(current) || !timeo)
 		{
-			printk(KERN_INFO "a signal comes!\n");
+			printk(KERN_INFO "a signal comes!2\n");
 			break;
 		}
 	}
@@ -685,7 +689,7 @@ int rudp_rcv(struct sk_buff *skb)
 				 inet_sdif(skb), udptable, skb);
 
 	if(sk)
-		return rudp_unicast_rcv_skb(sk,skb);
+		return rudp_unicast_rcv_skb_nc(sk,skb);
 	
 short_packet:
 	net_dbg_ratelimited("UDP%s: short packet: From %pI4:%u %d/%d to %pI4:%u\n",
@@ -702,32 +706,80 @@ drop:
 
 }
 
-int rudp_unicast_rcv_skb(struct sock *sk, struct sk_buff *skb)
+int rudp_unicast_rcv_skb_nc(struct sock *sk, struct sk_buff *skb)
 {
 	__be32 saddr, daddr;
 	saddr = ip_hdr(skb)->saddr;
 	daddr = ip_hdr(skb)->daddr;
-
+	struct sockaddr_in addrin;
 	struct RUDP_header *rh = rudp_hdr(skb);
 	struct udphdr *uh = udp_hdr(skb);
 	enum rudp_type packet_type = ntohs(rh->type<<8);
 	struct rudp_sock *rsk = rudp_sk(sk);
 
+	addrin.sin_addr.s_addr = saddr;
+	addrin.sin_port = (uh->source);
+	addrin.sin_family = AF_INET;
+
 	if(!rsk->isConnected)
 	{
 		rsk->isConnected = true;
-		struct sockaddr_in addrin;
-		addrin.sin_addr.s_addr = saddr;
-		addrin.sin_port = (uh->source);
-		addrin.sin_family = AF_INET;
 		ip4_datagram_connect(sk, (struct sockaddr *) &addrin, sizeof(addrin));
 	}
-	
 	if(packet_type==RUDP_TYPE_DATA)
 	{
-		if(ntohl(rh->seq)==rsk->ack_next+1||rsk->ack_next==0)
+		if(ntohl(rh->seq)==rsk->last_ack+1||rsk->last_ack==0)
 		{
-			rsk->ack_next = ntohl(rh->seq);
+			rsk->last_ack = ntohl(rh->seq);
+			skb_pull(skb,sizeof(struct RUDP_header));
+			rudp_send_ack(sk,ntohl(rh->seq));
+			printk("a data packet comes:%u!\n",ntohl(rh->seq));
+			return sock_queue_rcv_skb(sk, skb);
+		}
+		else
+		{
+			rudp_send_ack(sk,rsk->last_ack);
+			return 0;
+		}
+	}
+	
+	if(packet_type==RUDP_TYPE_ACK||packet_type==RUDP_TYPE_SYNACK)
+	{
+		printk(KERN_INFO "Received ack = %u!\n",ntohl(rh->ack));
+		unsigned int ackid = ntohl(rh->ack);
+		rudp_rcv_ack(sk,ackid);
+		rsk->win_size += 1;
+		return 0;
+	}
+
+	return 0;	
+}
+
+int rudp_unicast_rcv_skb(struct sock *sk, struct sk_buff *skb)
+{
+	__be32 saddr, daddr;
+	saddr = ip_hdr(skb)->saddr;
+	daddr = ip_hdr(skb)->daddr;
+	struct sockaddr_in addrin;
+	struct RUDP_header *rh = rudp_hdr(skb);
+	struct udphdr *uh = udp_hdr(skb);
+	enum rudp_type packet_type = ntohs(rh->type<<8);
+	struct rudp_sock *rsk = rudp_sk(sk);
+
+	addrin.sin_addr.s_addr = saddr;
+	addrin.sin_port = (uh->source);
+	addrin.sin_family = AF_INET;
+
+	if(!rsk->isConnected)
+	{
+		rsk->isConnected = true;
+		ip4_datagram_connect(sk, (struct sockaddr *) &addrin, sizeof(addrin));
+	}
+	if(packet_type==RUDP_TYPE_DATA&&rsk->state==RUDP_STATE_ESTABLISHED)
+	{
+		if(ntohl(rh->seq)==rsk->last_ack+1||rsk->last_ack==0)
+		{
+			rsk->last_ack = ntohl(rh->seq);
 			skb_pull(skb,sizeof(struct RUDP_header));
 			rudp_send_ack(sk,ntohl(rh->seq));
 			printk("a data packet comes!\n");
@@ -735,11 +787,38 @@ int rudp_unicast_rcv_skb(struct sock *sk, struct sk_buff *skb)
 		}
 		else
 		{
-			rudp_send_ack(sk,rsk->ack_next);
+			rudp_send_ack(sk,rsk->last_ack);
 			return 0;
 		}
-			
-	}else if(packet_type==RUDP_TYPE_ACK)
+	}
+	else if(packet_type==RUDP_TYPE_SYN&&rsk->state==RUDP_STATE_LISTEN)
+	{
+		rudp_send_synack(sk,(struct sockaddr*)&addrin,skb);
+		rsk->last_ack = ntohl(rh->seq);
+		rsk->state = RUDP_STATE_SYN_RECV;
+	}
+	else if(packet_type==RUDP_TYPE_SYNACK)
+	{
+		unsigned int ackid = htonl(rh->ack),seqid = htonl(rh->seq);
+		rudp_send_ack(sk,seqid);
+		if(ackid==rsk->send_next_seq-1)
+		{
+			if(rsk->state==RUDP_STATE_SYN_SENT)
+			{
+				rsk->last_ack = ackid;
+				rsk->state = RUDP_STATE_ESTABLISHED;
+				printk("Client coonection established!\n");
+			}	
+		}
+	}
+	else if(packet_type==RUDP_TYPE_ACK&&rsk->state==RUDP_STATE_SYN_RECV)
+	{
+		printk("Server connection established!\n");
+		rsk->state = RUDP_STATE_ESTABLISHED;
+	}
+	
+	
+	if(packet_type==RUDP_TYPE_ACK||packet_type==RUDP_TYPE_SYNACK)
 	{
 		printk(KERN_INFO "Received ack = %u!\n",ntohl(rh->ack));
 		unsigned int ackid = ntohl(rh->ack);
@@ -801,16 +880,15 @@ int rudp_rcv_ack(struct sock *sk, unsigned int ackid)
 			rsock->in_flight--;
 			rsock->in_queue--;
 			bh_unlock_sock(sk);
+			try_flush_send_queue(sk);
 			return 0;
 		}
 	}
 	bh_unlock_sock(sk);
 
-	try_flush_send_queue(sk);
 
 	return -1;
 }
-
 
 int rudp_send_synack(struct sock *sk, struct sockaddr *uaddr,struct sk_buff *skb)
 {
@@ -819,7 +897,7 @@ int rudp_send_synack(struct sock *sk, struct sockaddr *uaddr,struct sk_buff *skb
 	struct sockaddr_in *usin = (struct sockaddr_in *)uaddr;
 	struct inet_sock *inet = inet_sk(sk);
 
-	rsk->ack_next = ntohl(rh->seq);
+	rsk->last_ack = ntohl(rh->seq);
 	struct sk_buff *newskb = rudp_ip_make_skb(sk,0);
 
 	int offset = skb_transport_offset(newskb);
@@ -835,12 +913,11 @@ int rudp_send_synack(struct sock *sk, struct sockaddr *uaddr,struct sk_buff *skb
 
 	newrh->type = htons(RUDP_TYPE_SYNACK)>>8;
 	newrh->seq = htonl(rsk->send_next_seq++);
-	newrh->ack = htonl(rsk->ack_next++);
+	newrh->ack = htonl(rsk->last_ack++);
 	newrh->len = 0;
 	rudp_add_to_snd_queue(newskb);
 	return 0;
 }
-
 
 int rudp_err(struct sk_buff *skb, u32 info)
 {

@@ -22,6 +22,7 @@ enum rudp_type
 enum rsock_state
 {
 	RUDP_STATE_CLOSED,
+	RUDP_STATE_LISTEN,
 	RUDP_STATE_SYN_SENT,
 	RUDP_STATE_SYN_RECV,
 	RUDP_STATE_ESTABLISHED,
@@ -43,14 +44,12 @@ struct RUDP_header{
 
 struct rudp_sock{
 	struct udp_sock usock;
-	long send_next_seq;
-	long ack_next;
-	struct timer_list retransmit_timer;
+	unsigned int send_next_seq,last_ack;
+	struct timer_list retransmit_timer, delack_timer;
 	long retrans_timeout;
 	long max_retrans_time;
 	int win_size,in_flight;
 	int buf_size,in_queue;
-	long latest_ack;
 	bool isClient,isConnected;
 	enum rsock_state state;
 
@@ -97,6 +96,8 @@ int rudp_rcv(struct sk_buff *skb);
 int rudp_err(struct sk_buff *skb, u32 info);
 
 int rudp_unicast_rcv_skb(struct sock *sk, struct sk_buff *skb);
+int rudp_unicast_rcv_skb_nc(struct sock *sk, struct sk_buff *skb); // no connection version
+
 
 int rudp_send_syn(struct sock *sk, struct sockaddr *uaddr);
 int rudp_send_synack(struct sock *sk, struct sockaddr *uaddr,struct sk_buff *skb);

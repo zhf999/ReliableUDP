@@ -35,7 +35,7 @@ void init_RUDP(void)
 	rudp_prot.sendmsg = rudp_sendmsg;
 	rudp_prot.recvmsg = rudp_recvmsg;
 	rudp_prot.init = rudp_init;
-	// rudp_prot.connect = rudp_connect;
+	rudp_prot.connect = rudp_connect;
 	rudp_prot.close = rudp_close;
 	rudp_prot.obj_size = sizeof(struct rudp_sock);
 	// rudp_prot.accept = rudp_accept;
