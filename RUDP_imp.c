@@ -11,15 +11,19 @@ int rudp_init(struct sock *sk)
 	skb_queue_head_init(&rsock->out_queue);
 
 	rsock->win_size = 1;
-	rsock->buf_size = 10;
+	rsock->buf_size = 16;
 	rsock->in_flight = 0;
 	rsock->in_queue = 0;
 
 	timer_setup(&rsock->retransmit_timer,retransmit_handler,0);
-	timer_setup(&rsock->delack_timer,delack_timer_handler,0);
-	rsock->retrans_timeout = HZ;
+	timer_setup(&rsock->delack_timer,delack_handler,0);
+
+	rsock->retrans_timeout = HZ/100;
 	rsock->last_ack = 0;
 	rsock->max_retrans_time = 5;
+
+	rsock->continue_nack = 0;
+	rsock->thresh = 32;
 
 	get_random_bytes(&rsock->send_next_seq,sizeof(rsock->send_next_seq));
 	return udp_prot.init(sk);
@@ -38,20 +42,22 @@ void retransmit_handler(struct timer_list *t)
 	if(sock_owned_by_user(sk))
 	{
 		printk(KERN_INFO "sock is locked!\n");
-		reset_rudp_xmit_timer(sk,HZ/5);
+		reset_rudp_xmit_timer(sk,rsk->retrans_timeout>>1);
 		bh_unlock_sock(sk);
 		sock_put(sk);
 		return ;
 	}
 	struct sk_buff *pskb,*tmp;
+	int cnt = 0;
 	skb_queue_walk(&rsk->out_queue,pskb)
 	{
+		cnt++;
 		struct RUDP_header *rh = rudp_hdr(pskb);
 		printk(KERN_INFO "retransmit packet: seq=%u ack=%u\n",ntohl(rh->seq),ntohl(rh->ack));
 		tmp = skb_clone(pskb,GFP_ATOMIC);
 		ip_send_skb(sock_net(sk),tmp);
 	}
-	rsk->win_size -= 1;
+	win_dec(sk);
 	bh_unlock_sock(sk);
 	// try_flush_send_queue(sk);
 
@@ -61,9 +67,27 @@ void retransmit_handler(struct timer_list *t)
 	sock_put(sk);
 }
 
-void retransmit_handler(struct timer_list *t)
+void delack_handler(struct timer_list *t)
 {
-	
+	struct rudp_sock *rsk =
+			from_timer(rsk, t, delack_timer);
+	struct sock *sk = (struct sock*)rsk;	
+
+	bh_lock_sock(sk);
+	// printk("delack timer is activated!\n");
+	if(sock_owned_by_user(sk))
+	{
+		printk(KERN_INFO "sock is locked!\n");
+		reset_rudp_delack_timer(sk,rsk->retrans_timeout>>1);
+		bh_unlock_sock(sk);
+		sock_put(sk);
+		return ;
+	}
+	if(rsk->isConnected&&rsk->last_ack!=0)
+		rudp_send_ack(sk,rsk->last_ack);
+	bh_unlock_sock(sk);
+	sock_put(sk);
+	return ;
 }
 
 void reset_rudp_xmit_timer(struct sock *sk,long delay)
@@ -79,6 +103,19 @@ void clear_rudp_xmit_timer(struct sock *sk)
 	sk_stop_timer_sync(sk,&rsk->retransmit_timer);
 	// del_timer_sync(&rsk->retransmit_timer);
 }
+
+void reset_rudp_delack_timer(struct sock *sk, long delay)
+{
+	struct rudp_sock * rsk = rudp_sk(sk);
+	sk_reset_timer(sk,&rsk->delack_timer,jiffies+delay);
+}
+
+void clear_rudp_delack_timer(struct sock *sk)
+{
+	struct rudp_sock *rsk = (struct rudp_sock *)sk;
+	sk_stop_timer_sync(sk,&rsk->delack_timer);
+}
+
 
 int rudp_connect(struct sock *sk,struct sockaddr *uaddr,int addr_len)
 {
@@ -492,10 +529,6 @@ int rudp_add_to_snd_queue(struct sk_buff *skb)
 		return 0;
 	}
 	// printk(KERN_INFO "add a skb to write queue\n");	
-	if(skb_queue_empty(&sk->sk_write_queue))
-	{
-		reset_rudp_xmit_timer(sk,rudp_sk(sk)->retrans_timeout);
-	}
 
 	if(rsock->in_queue==rsock->buf_size)
 	{
@@ -536,6 +569,10 @@ int try_flush_send_queue(struct sock *sk)
 	struct rudp_sock *rsock = rudp_sk(sk);
 	struct sk_buff *pskb,*skb,*temp;
 	local_bh_disable();
+	if(skb_queue_empty(&rsock->out_queue)&&!skb_queue_empty(&sk->sk_write_queue))
+	{
+		reset_rudp_xmit_timer(sk,rudp_sk(sk)->retrans_timeout);
+	}
 	skb_queue_walk_safe(&sk->sk_write_queue,pskb,temp)
 	{
 		if(rsock->in_flight>=rsock->win_size)
@@ -543,6 +580,7 @@ int try_flush_send_queue(struct sock *sk)
 		skb = skb_clone(pskb,GFP_ATOMIC);
 		ip_send_skb(sock_net(sk),skb);
 		rsock->in_flight++;
+		rsock->in_queue--;
 		skb_unlink(pskb,&sk->sk_write_queue);
 		skb_queue_tail(&rsock->out_queue,pskb);
 		printk(KERN_INFO "flush : skb->type=%x seq=%u ack=%u\n",
@@ -616,14 +654,13 @@ void rudp_close(struct sock *sk,long timeout)
 	struct rudp_sock *rsock = rudp_sk(sk);
 	DEFINE_WAIT_FUNC(wait, woken_wake_function);
 	add_wait_queue(sk_sleep(sk), &wait);
-	long timeo = 0;
 	lock_sock(sk);
 	while (rsock->in_flight!=0) {
 		// printk(KERN_INFO "sleep for a while\n");
 		release_sock(sk);
-		timeo = wait_woken(&wait, TASK_INTERRUPTIBLE, timeo);
+		wait_woken(&wait, TASK_INTERRUPTIBLE, MAX_SCHEDULE_TIMEOUT);
 		lock_sock(sk);
-		if (signal_pending(current) || !timeo)
+		if (signal_pending(current))
 		{
 			printk(KERN_INFO "a signal comes!2\n");
 			break;
@@ -732,13 +769,18 @@ int rudp_unicast_rcv_skb_nc(struct sock *sk, struct sk_buff *skb)
 		{
 			rsk->last_ack = ntohl(rh->seq);
 			skb_pull(skb,sizeof(struct RUDP_header));
-			rudp_send_ack(sk,ntohl(rh->seq));
+			reset_rudp_delack_timer(sk,rsk->retrans_timeout>>1);
+			// rudp_send_ack(sk,ntohl(rh->seq));
 			printk("a data packet comes:%u!\n",ntohl(rh->seq));
+			rsk->continue_nack = 0;
 			return sock_queue_rcv_skb(sk, skb);
 		}
 		else
 		{
-			rudp_send_ack(sk,rsk->last_ack);
+			// printk("expected %u\n",rsk->last_ack);
+			rsk->continue_nack ++;
+			if(rsk->continue_nack>=2)
+				rudp_send_ack(sk,rsk->last_ack);
 			return 0;
 		}
 	}
@@ -748,7 +790,7 @@ int rudp_unicast_rcv_skb_nc(struct sock *sk, struct sk_buff *skb)
 		printk(KERN_INFO "Received ack = %u!\n",ntohl(rh->ack));
 		unsigned int ackid = ntohl(rh->ack);
 		rudp_rcv_ack(sk,ackid);
-		rsk->win_size += 1;
+		win_inc(sk);
 		return 0;
 	}
 
@@ -868,6 +910,7 @@ int rudp_rcv_ack(struct sock *sk, unsigned int ackid)
 
 	bh_lock_sock(sk);
 	struct sk_buff *pskb,*temp;
+	bool isCleared = false;
 
 	skb_queue_walk_safe(&rsock->out_queue,pskb,temp)
 	{
@@ -875,15 +918,16 @@ int rudp_rcv_ack(struct sock *sk, unsigned int ackid)
 		if(ntohl(rh->seq)<=ackid)
 		{
 			printk(KERN_INFO "Remove ack=%u from queue\n",ntohl(rh->seq));
-			skb_unlink(pskb,&sk->sk_write_queue);
+			skb_unlink(pskb,&rsock->out_queue);
 			kfree_skb(pskb);
 			rsock->in_flight--;
-			rsock->in_queue--;
-			bh_unlock_sock(sk);
-			try_flush_send_queue(sk);
-			return 0;
+			// rsock->in_queue--;
+			isCleared = true;
 		}
 	}
+
+	if(isCleared)
+		try_flush_send_queue(sk);
 	bh_unlock_sock(sk);
 
 
@@ -923,4 +967,29 @@ int rudp_err(struct sk_buff *skb, u32 info)
 {
     struct net_protocol *udp_protocol_ref = rcu_dereference(inet_protos[IPPROTO_UDP]);
     return udp_protocol_ref->err_handler(skb,info);
+}
+
+void win_inc(struct sock *sk)
+{
+	struct rudp_sock *rsk = rudp_sk(sk);
+	if(rsk->win_size==1)
+	{
+		rsk->win_size = 16;
+		return ;
+	}
+
+	if(rsk->win_size<=rsk->thresh)
+		rsk->win_size *= 2;
+	else
+		rsk->win_size += 2;
+
+	if(rsk->win_size>=64)
+		rsk->win_size = 64;
+}
+void win_dec(struct sock *sk)
+{
+	struct rudp_sock *rsk = rudp_sk(sk);
+	rsk->win_size = rsk->win_size*4/5;
+	if(rsk->win_size<1)
+		rsk->win_size = 1;
 }

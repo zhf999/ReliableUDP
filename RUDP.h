@@ -54,6 +54,8 @@ struct rudp_sock{
 	enum rsock_state state;
 
 	struct sk_buff_head	out_queue;
+
+	int continue_nack,thresh;
 };
 
 struct rudp_skb_cb {
@@ -98,7 +100,6 @@ int rudp_err(struct sk_buff *skb, u32 info);
 int rudp_unicast_rcv_skb(struct sock *sk, struct sk_buff *skb);
 int rudp_unicast_rcv_skb_nc(struct sock *sk, struct sk_buff *skb); // no connection version
 
-
 int rudp_send_syn(struct sock *sk, struct sockaddr *uaddr);
 int rudp_send_synack(struct sock *sk, struct sockaddr *uaddr,struct sk_buff *skb);
 int rudp_send_ack(struct sock *sk, unsigned int ackid);
@@ -107,8 +108,11 @@ int rudp_rcv_ack(struct sock *sk, unsigned int ackid);
 long inet_wait_for_connect(struct sock *sk, long timeo, int writebias);
 
 void retransmit_handler(struct timer_list *t);
+void delack_handler(struct timer_list *t);
 void reset_rudp_xmit_timer(struct sock *sk,long delay);
 void clear_rudp_xmit_timer(struct sock *sk);
+void reset_rudp_delack_timer(struct sock *sk, long delay);
+void clear_rudp_delack_timer(struct sock *sk);
 
 
 struct sk_buff *rudp_ip_make_skb(struct sock *sk, int length);
@@ -117,3 +121,5 @@ int rudp_send_skb(struct net *net, struct flowi4 *fl4,struct sk_buff *skb);
 int rudp_add_to_snd_queue(struct sk_buff *skb);
 int try_flush_send_queue(struct sock *sk);
 
+void win_inc(struct sock *sk);
+void win_dec(struct sock *sk);
