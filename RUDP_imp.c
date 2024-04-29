@@ -25,6 +25,7 @@ int rudp_init(struct sock *sk)
 	rsock->continue_nack = 0;
 	rsock->thresh = 32;
 
+	// initialize seq number
 	get_random_bytes(&rsock->send_next_seq,sizeof(rsock->send_next_seq));
 	return udp_prot.init(sk);
 }
@@ -38,9 +39,11 @@ void retransmit_handler(struct timer_list *t)
 	if(skb_queue_empty(&rsk->out_queue))
 		return ;
 
+	// button half sock lock
 	bh_lock_sock(sk);
 	if(sock_owned_by_user(sk))
 	{
+		// if sock is hold by user process, call it later
 		printk(KERN_INFO "sock is locked!\n");
 		reset_rudp_xmit_timer(sk,rsk->retrans_timeout>>1);
 		bh_unlock_sock(sk);
@@ -49,6 +52,7 @@ void retransmit_handler(struct timer_list *t)
 	}
 	struct sk_buff *pskb,*tmp;
 	int cnt = 0;
+	// retransmit all packet in out_queue
 	skb_queue_walk(&rsk->out_queue,pskb)
 	{
 		cnt++;
@@ -57,10 +61,12 @@ void retransmit_handler(struct timer_list *t)
 		tmp = skb_clone(pskb,GFP_ATOMIC);
 		ip_send_skb(sock_net(sk),tmp);
 	}
+	
+	// decrease window size
 	win_dec(sk);
 	bh_unlock_sock(sk);
-	// try_flush_send_queue(sk);
 
+	// if out_queue is not empty, retransmit handler will be called again
 	if(!skb_queue_empty(&rsk->out_queue))
 		reset_rudp_xmit_timer(sk,rsk->retrans_timeout);
 
@@ -74,15 +80,16 @@ void delack_handler(struct timer_list *t)
 	struct sock *sk = (struct sock*)rsk;	
 
 	bh_lock_sock(sk);
-	// printk("delack timer is activated!\n");
 	if(sock_owned_by_user(sk))
 	{
+		// if sock is hold by user process, call it later
 		printk(KERN_INFO "sock is locked!\n");
 		reset_rudp_delack_timer(sk,rsk->retrans_timeout>>1);
 		bh_unlock_sock(sk);
 		sock_put(sk);
 		return ;
 	}
+	// send an ack
 	if(rsk->isConnected&&rsk->last_ack!=0)
 		rudp_send_ack(sk,rsk->last_ack);
 	bh_unlock_sock(sk);
@@ -93,7 +100,6 @@ void delack_handler(struct timer_list *t)
 void reset_rudp_xmit_timer(struct sock *sk,long delay)
 {
 	struct rudp_sock *rsk = (struct rudp_sock*)sk;
-	// mod_timer(&rsk->retransmit_timer,jiffies+delay);
 	sk_reset_timer(sk,&rsk->retransmit_timer,jiffies + delay);
 }
 
@@ -117,6 +123,7 @@ void clear_rudp_delack_timer(struct sock *sk)
 }
 
 
+// deprecated
 int rudp_connect(struct sock *sk,struct sockaddr *uaddr,int addr_len)
 {
 	long timeo = rudp_sk(sk)->retrans_timeout*10;
@@ -145,6 +152,7 @@ int rudp_connect(struct sock *sk,struct sockaddr *uaddr,int addr_len)
 	return res;
 }
 
+// deprecated
 int rudp_send_syn(struct sock *sk, struct sockaddr *uaddr)
 {
 	struct rudp_sock *rsk = rudp_sk(sk);
@@ -388,7 +396,6 @@ struct sk_buff *rudp_ip_make_skb(struct sock *sk, int length)
 
 	__skb_queue_head_init(&queue);
 
-	// Get the route for IP as the socket is already QUIC connected
 	rt = (struct rtable *)sk_dst_check(sk, 0);
 
 	ipc.opt = NULL;
@@ -415,7 +422,7 @@ struct sk_buff *rudp_ip_make_skb(struct sock *sk, int length)
 		printk(KERN_INFO "err1\n");
 		return ERR_PTR(err);
 	}
-//data is copied to the socket buffer by the function ip_make_skb 
+	//data is copied to the socket buffer by the function ip_make_skb 
 	struct sk_buff* skb =  __ip_make_skb(sk, fl4, &queue, &cork);
 	skb->sk = sk;
 	return skb;
@@ -442,11 +449,9 @@ int __rudp_make_skb(struct sock *sk,
 
 	fragheaderlen = sizeof(struct iphdr);
 
-//alloc_new_skb:
-
 	fraglen = sizeof(struct RUDP_header) + fragheaderlen;
 
-	alloclen = fraglen;                 //length of QUIC hdr + ID hdr
+	alloclen = fraglen;                
 
 	alloclen += exthdrlen;              //extentions header 
 	alloclen += rt->dst.trailer_len;    //destination trailer length
@@ -494,11 +499,8 @@ int rudp_send_skb(struct net *net,struct flowi4 *fl4, struct sk_buff *skb)
 	struct rudp_sock *rsock = rudp_sk(sk);
 	struct udphdr *uh;
 	struct RUDP_header *ruh;
-	// int err;
-	// int is_udplite = IS_UDPLITE(sk);
 	int offset = skb_transport_offset(skb);
 	int len = skb->len - offset;
-	// int datalen = len - sizeof(*uh);
 
 	/*
 	 * Create a UDP header
@@ -509,12 +511,13 @@ int rudp_send_skb(struct net *net,struct flowi4 *fl4, struct sk_buff *skb)
 	uh->len = htons(len);
 	uh->check = 0;
 
+	// Create a RUDP header
 	ruh = rudp_hdr(skb);
 	ruh->seq = htonl(rsock->send_next_seq++);
 	ruh->type = htons(RUDP_TYPE_DATA);
 	ruh->len = htons(len-sizeof(struct RUDP_header));
 
-	// ip_send_skb(sock_net(sk),skb);
+	// try to add this skb to send queue
 	rudp_add_to_snd_queue(skb);
 	return 0;
 }
@@ -528,8 +531,8 @@ int rudp_add_to_snd_queue(struct sk_buff *skb)
 		printk("no sk!\n");
 		return 0;
 	}
-	// printk(KERN_INFO "add a skb to write queue\n");	
 
+	// if send_queue is full, block util there is enough space
 	if(rsock->in_queue==rsock->buf_size)
 	{
 		DEFINE_WAIT_FUNC(wait, woken_wake_function);
@@ -552,9 +555,11 @@ int rudp_add_to_snd_queue(struct sk_buff *skb)
 		printk(KERN_INFO "put %u into quque!\n",htonl(rudp_hdr(skb)->seq));
 	}
 
+	// add a skb to send queue
 	skb_queue_tail(&sk->sk_write_queue, skb);
 	rsock->in_queue++;
 
+	// check if more skb in send_queue can be send out
 	try_flush_send_queue(sk);
 	return 0;
 }
@@ -568,11 +573,15 @@ int try_flush_send_queue(struct sock *sk)
 	
 	struct rudp_sock *rsock = rudp_sk(sk);
 	struct sk_buff *pskb,*skb,*temp;
+
+	// disable soft interrupt
 	local_bh_disable();
 	if(skb_queue_empty(&rsock->out_queue)&&!skb_queue_empty(&sk->sk_write_queue))
 	{
 		reset_rudp_xmit_timer(sk,rudp_sk(sk)->retrans_timeout);
 	}
+	// if out queue is not full, send a skb from send_queue, then move it from
+	// send_queue to out_queue
 	skb_queue_walk_safe(&sk->sk_write_queue,pskb,temp)
 	{
 		if(rsock->in_flight>=rsock->win_size)
@@ -600,13 +609,12 @@ int rudp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len, int fla
 	int off, err, peeking = flags & MSG_PEEK;
 
 	off = sk_peek_offset(sk, flags);
+	// try to get a skb from receive_queue
+	// when receive queue is empty, process blocks
 	skb = __skb_recv_udp(sk, flags, &off, &err);
 	if (!skb)
 		return err;
 
-	// struct RUDP_header *ruh = rudp_hdr(skb);
-
-	// ulen = udp_skb_len(skb);
 	ulen = skb->len;
 	copied = len;
 	if (copied > ulen - off)
@@ -652,6 +660,7 @@ int rudp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags, int
 void rudp_close(struct sock *sk,long timeout)
 {
 	struct rudp_sock *rsock = rudp_sk(sk);
+	// wait until all packet is acknowledged by peer
 	DEFINE_WAIT_FUNC(wait, woken_wake_function);
 	add_wait_queue(sk_sleep(sk), &wait);
 	lock_sock(sk);
@@ -673,6 +682,7 @@ void rudp_close(struct sock *sk,long timeout)
 	printk(KERN_INFO "closing soket\n");
 	printk("ref: %d\n",refcount_read(&sk->sk_refcnt));
 	// skb_queue_purge(&sk->sk_receive_queue);
+	// clean write queue
 	skb_queue_purge(&sk->sk_write_queue);
 	udp_prot.close(sk,timeout);
 }
@@ -758,26 +768,30 @@ int rudp_unicast_rcv_skb_nc(struct sock *sk, struct sk_buff *skb)
 	addrin.sin_port = (uh->source);
 	addrin.sin_family = AF_INET;
 
+	// before communicate, connect to peer (store peer address and port)
 	if(!rsk->isConnected)
 	{
 		rsk->isConnected = true;
 		ip4_datagram_connect(sk, (struct sockaddr *) &addrin, sizeof(addrin));
 	}
+	
 	if(packet_type==RUDP_TYPE_DATA)
 	{
+		// the packet is what we expected
 		if(ntohl(rh->seq)==rsk->last_ack+1||rsk->last_ack==0)
 		{
 			rsk->last_ack = ntohl(rh->seq);
 			skb_pull(skb,sizeof(struct RUDP_header));
+			// every packet we receive will delay ack sending
 			reset_rudp_delack_timer(sk,rsk->retrans_timeout>>1);
-			// rudp_send_ack(sk,ntohl(rh->seq));
 			printk("a data packet comes:%u!\n",ntohl(rh->seq));
 			rsk->continue_nack = 0;
 			return sock_queue_rcv_skb(sk, skb);
 		}
 		else
 		{
-			// printk("expected %u\n",rsk->last_ack);
+			// ack packet may get lost, if this occurs, we will receive unexpected packet
+			// this scope avoid this situation
 			rsk->continue_nack ++;
 			if(rsk->continue_nack>=2)
 				rudp_send_ack(sk,rsk->last_ack);
@@ -785,6 +799,7 @@ int rudp_unicast_rcv_skb_nc(struct sock *sk, struct sk_buff *skb)
 		}
 	}
 	
+	// if receive a ack packet
 	if(packet_type==RUDP_TYPE_ACK||packet_type==RUDP_TYPE_SYNACK)
 	{
 		printk(KERN_INFO "Received ack = %u!\n",ntohl(rh->ack));
@@ -797,6 +812,7 @@ int rudp_unicast_rcv_skb_nc(struct sock *sk, struct sk_buff *skb)
 	return 0;	
 }
 
+// deprecated
 int rudp_unicast_rcv_skb(struct sock *sk, struct sk_buff *skb)
 {
 	__be32 saddr, daddr;
@@ -912,6 +928,7 @@ int rudp_rcv_ack(struct sock *sk, unsigned int ackid)
 	struct sk_buff *pskb,*temp;
 	bool isCleared = false;
 
+	// remove packet whose ack==ackid from out_queue
 	skb_queue_walk_safe(&rsock->out_queue,pskb,temp)
 	{
 		rh = rudp_hdr(pskb);
@@ -926,6 +943,7 @@ int rudp_rcv_ack(struct sock *sk, unsigned int ackid)
 		}
 	}
 
+	// if there is a skb removed from out_queue, then try flush new packet from send_queue
 	if(isCleared)
 		try_flush_send_queue(sk);
 	bh_unlock_sock(sk);
@@ -934,6 +952,7 @@ int rudp_rcv_ack(struct sock *sk, unsigned int ackid)
 	return -1;
 }
 
+// deprecated
 int rudp_send_synack(struct sock *sk, struct sockaddr *uaddr,struct sk_buff *skb)
 {
 	struct RUDP_header *rh = rudp_hdr(skb);
