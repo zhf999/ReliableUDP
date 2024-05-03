@@ -66,7 +66,7 @@ struct rudp_sock{
 	struct sk_buff_head	out_queue;
 
 	// how many packet are not acked continuely
-	int continue_nack,
+	int continue_nack;
 	// congestion control: when win_size is greater then thresh, it will increase by 2 instead of by multiplying
 	int thresh;
 };
