@@ -664,8 +664,8 @@ void rudp_close(struct sock *sk,long timeout)
 	DEFINE_WAIT_FUNC(wait, woken_wake_function);
 	add_wait_queue(sk_sleep(sk), &wait);
 	lock_sock(sk);
-	while (rsock->in_flight!=0) {
-		// printk(KERN_INFO "sleep for a while\n");
+	while (!skb_queue_empty(&rsock->out_queue)) {
+		printk(KERN_INFO "sleep for a while\n");
 		release_sock(sk);
 		wait_woken(&wait, TASK_INTERRUPTIBLE, MAX_SCHEDULE_TIMEOUT);
 		lock_sock(sk);
@@ -925,6 +925,7 @@ int rudp_rcv_ack(struct sock *sk, unsigned int ackid)
 	struct rudp_sock *rsock = rudp_sk(sk);
 
 	bh_lock_sock(sk);
+
 	struct sk_buff *pskb,*temp;
 	bool isCleared = false;
 
@@ -944,10 +945,12 @@ int rudp_rcv_ack(struct sock *sk, unsigned int ackid)
 	}
 
 	// if there is a skb removed from out_queue, then try flush new packet from send_queue
-	if(isCleared)
-		try_flush_send_queue(sk);
-	bh_unlock_sock(sk);
 
+	if(isCleared)
+			try_flush_send_queue(sk);
+	bh_unlock_sock(sk);	
+	
+	
 
 	return -1;
 }
